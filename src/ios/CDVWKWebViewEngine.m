@@ -6,9 +6,9 @@
  to you under the Apache License, Version 2.0 (the
  "License"); you may not use this file except in compliance
  with the License.  You may obtain a copy of the License at
-
+ 
  http://www.apache.org/licenses/LICENSE-2.0
-
+ 
  Unless required by applicable law or agreed to in writing,
  software distributed under the License is distributed on an
  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
@@ -23,6 +23,11 @@
 #import <MobileCoreServices/MobileCoreServices.h>
 #import <objc/message.h>
 #import "GCDWebServer.h"
+#import "GCDWebServerResponse.h"
+#import "GCDWebServerDataResponse.h"
+#import "GCDWebServerDataRequest.h"
+#import "GCDWebServerErrorResponse.h"
+#import "AFNetworking.h"
 
 #define CDV_BRIDGE_NAME @"cordova"
 #define CDV_IONIC_STOP_SCROLL @"stopScroll"
@@ -45,6 +50,9 @@
 @property (nonatomic, strong, readwrite) id <WKUIDelegate> uiDelegate;
 @property (nonatomic, weak) id <WKScriptMessageHandler> weakScriptMessageHandler;
 @property (nonatomic, strong) GCDWebServer *webServer;
+@property (nonatomic, strong) NSString *proxyUrl;
+@property (nonatomic, strong) NSString *proxyMode;
+@property (nonatomic, strong) NSString *secret;
 
 @end
 
@@ -62,16 +70,134 @@
         if (NSClassFromString(@"WKWebView") == nil) {
             return nil;
         }
-
+        
         self.engineWebView = [[WKWebView alloc] initWithFrame:frame];
         self.fileQueue = [[NSOperationQueue alloc] init];
-
-        self.webServer = [[GCDWebServer alloc] init];
-        [self.webServer addGETHandlerForBasePath:@"/" directoryPath:@"/" indexFilename:nil cacheAge:3600 allowRangeRequests:YES];
-        [self.webServer startWithPort:8080 bonjourName:nil];
+        
+        
     }
-
     return self;
+}
+
+- (void)startServer
+{
+    __weak CDVWKWebViewEngine *weakSelf = self;
+
+    if ([@"LOCALWEB" isEqualToString:self.proxyMode]) {
+        self.webServer = [[GCDWebServer alloc] init];
+        
+        [self.webServer addGETHandlerForBasePath:@"/" directoryPath:@"/" indexFilename:nil cacheAge:3600 allowRangeRequests:YES];
+    } else if ([@"LOCALPROXY" isEqualToString:self.proxyMode]) {
+        self.webServer = [[GCDWebServer alloc] init];
+        [self.webServer addHandlerForMethod:@"POST"
+                                  pathRegex:@"/api/*"
+                               requestClass:[GCDWebServerDataRequest class]
+                          asyncProcessBlock:^(GCDWebServerDataRequest *request, GCDWebServerCompletionBlock completionBlock) {
+                              CDVWKWebViewEngine *strongSelf = weakSelf;
+                              
+                              NSDictionary *headers = request.headers;
+                              NSString* urlString = headers[@"X-original-url"];
+                              NSURL *url = [NSURL URLWithString:urlString];
+                              NSLog(@"JSON: original url, %@", url);
+                              NSString* reqSecret = headers[@"X-proxy-secret"];
+                              if (![strongSelf.secret isEqualToString:reqSecret]) {
+                                  GCDWebServerResponse *res = [GCDWebServerDataResponse responseWithStatusCode:500];
+                                  [strongSelf setCORSHeaders:res];
+                                  [res setValue:@"0" forAdditionalHeader:@"Content-Length"];
+                                  completionBlock(res);
+                                  return;
+                              }
+
+                              // 2
+                              //AFHTTPSessionManager *manager = [AFHTTPSessionManager manager];
+                              AFURLSessionManager *manager = [[AFURLSessionManager alloc] initWithSessionConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]];
+                              NSMutableURLRequest *req = [[AFJSONRequestSerializer serializer] requestWithMethod:@"POST" URLString:url.absoluteString parameters:nil error:nil];
+                              
+                              for (NSString *key in headers) {
+                                  NSString *value;
+                                  value = headers[key];
+                                  [req setValue:value forHTTPHeaderField:key];
+                                  NSLog(@"JSON: req header key, %@", key);
+                                  NSLog(@"JSON: req header value, %@", value);
+                              }
+                              NSError *error;
+                              NSData *jsonData = [NSJSONSerialization dataWithJSONObject:request.jsonObject options:0 error:&error];
+                              NSString *jsonString = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+                              [req setHTTPBody:[jsonString dataUsingEncoding:NSUTF8StringEncoding]];
+                              
+                              [[manager dataTaskWithRequest:req completionHandler:^(NSURLResponse *_Nonnull dataResponse, id _Nullable responseObject, NSError *_Nullable error) {
+                                  if (!error) {
+                                      NSLog(@"JSON: result post, %@", dataResponse.URL);
+                                      
+                                      GCDWebServerResponse *res = [GCDWebServerDataResponse responseWithJSONObject:responseObject contentType:@"application/json"];
+                                      NSHTTPURLResponse *response = (NSHTTPURLResponse *) dataResponse;
+                                      [res setStatusCode:200];
+                                      NSDictionary *responseHeaders = response.allHeaderFields;
+                                      for (NSString *key in responseHeaders) {
+                                          NSString *value;
+                                          value = responseHeaders[key];
+                                          NSLog(@"JSON: result header key, %@", key);
+                                          NSLog(@"JSON: result header value, %@", value);
+                                          if (![key isEqual:@"Content-Encoding"]) {
+                                              [res setValue:value forAdditionalHeader:key];
+                                          }
+                                          
+                                      }
+                                      [strongSelf setCORSHeaders:res];
+                                      
+                                      completionBlock(res);
+                                  } else {
+                                      NSLog(@"Error: %@", error);
+                                      GCDWebServerErrorResponse *res = [GCDWebServerErrorResponse responseWithStatusCode:500];
+                                      [strongSelf setCORSHeaders:res];
+                                      completionBlock(res);
+                                  }
+                              }] resume];
+                          }];
+        
+        [self.webServer addDefaultHandlerForMethod:@"OPTIONS"
+                                      requestClass:[GCDWebServerRequest class]
+                                      processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
+                                          NSLog(@"JSON: OPTIONS data");
+                                          CDVWKWebViewEngine *strongSelf = weakSelf;
+                                          GCDWebServerDataResponse *res = [GCDWebServerDataResponse responseWithStatusCode:200];
+                                          
+                                          [strongSelf setCORSHeaders:res];
+                                          [res setValue:@"0" forAdditionalHeader:@"Content-Length"];
+                                          return res;
+                                          
+                                      }];
+    }
+    if (self.webServer != nil) {
+        int maxRetryCount = 5;
+        NSNumber *port = @8080;
+        for (int i = 0; i < maxRetryCount; i ++) {
+            BOOL isError = false;
+            @try {
+                [self.webServer startWithOptions:@{
+                                                   @"Port": port,
+                                                   @"AutomaticallySuspendInBackground": @NO
+                                                   } error:nil];
+            }
+            @catch (NSException *exception) {
+                NSLog(@"%@", exception.reason);
+                port = @([port intValue] + 100);
+                isError = true;
+            }
+            if (!isError) {
+                self.proxyUrl = [NSString stringWithFormat:@"%@%@", @"http://localhost:", [port stringValue]];
+                break;
+            }
+        }
+    }
+}
+
+- (void) setCORSHeaders: (GCDWebServerResponse*)res
+{
+    [res setValue:@"*" forAdditionalHeader:@"Access-Control-Allow-Origin"];
+    [res setValue:@"POST, GET, PUT, DELETE, OPTIONS" forAdditionalHeader:@"Access-Control-Allow-Methods"];
+    [res setValue:@"1728000" forAdditionalHeader:@"Access-Control-Max-Age"];
+    [res setValue:@"Access-Control-Allow-Methods,Access-Control-Max-Age, Access-Control-Allow-Headers,Access-Control-Allow-Credentials, Access-Control-Allow-Origin, Authorization, Origin, X-Requested-With, X-HTTP-Method-Override, Content-Type, Accept, X-original-url, X-proxy-secret" forAdditionalHeader:@"Access-Control-Allow-Headers"];
 }
 
 - (WKWebViewConfiguration*) createConfigurationFromSettings:(NSDictionary*)settings
@@ -80,12 +206,12 @@
     if (settings == nil) {
         return configuration;
     }
-
+    
     configuration.allowsInlineMediaPlayback = [settings cordovaBoolSettingForKey:@"AllowInlineMediaPlayback" defaultValue:NO];
     configuration.mediaPlaybackRequiresUserAction = [settings cordovaBoolSettingForKey:@"MediaPlaybackRequiresUserAction" defaultValue:YES];
     configuration.suppressesIncrementalRendering = [settings cordovaBoolSettingForKey:@"SuppressesIncrementalRendering" defaultValue:NO];
     configuration.mediaPlaybackAllowsAirPlay = [settings cordovaBoolSettingForKey:@"MediaPlaybackAllowsAirPlay" defaultValue:YES];
-
+    
     return configuration;
 }
 
@@ -93,15 +219,19 @@
 {
     // viewController would be available now. we attempt to set all possible delegates to it, by default
     NSDictionary* settings = self.commandDelegate.settings;
-
+    self.proxyMode = [settings cordovaSettingForKey:@"ProxyMode"];
+    if (![@"DISABLEPROXY" isEqualToString:self.proxyMode]) {
+        [self startServer];
+    }
+    
     self.uiDelegate = [[CDVWKWebViewUIDelegate alloc] initWithTitle:[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleDisplayName"]];
-
+    
     CDVWKWeakScriptMessageHandler *weakScriptMessageHandler = [[CDVWKWeakScriptMessageHandler alloc] initWithScriptMessageHandler:self];
-
+    
     WKUserContentController* userContentController = [[WKUserContentController alloc] init];
     [userContentController addScriptMessageHandler:weakScriptMessageHandler name:CDV_BRIDGE_NAME];
     [userContentController addScriptMessageHandler:weakScriptMessageHandler name:CDV_IONIC_STOP_SCROLL];
-
+    
     // Inject XHR Polyfill
     BOOL disableXHRPolyfill = [settings cordovaBoolSettingForKey:@"DisableXHRPolyfill" defaultValue:NO];
     if (!disableXHRPolyfill) {
@@ -113,44 +243,60 @@
     } else {
         NSLog(@"CDVWKWebViewEngine: skipped XHR polyfill");
     }
-
+    
+    // Inject XHR Proxy Polyfill
+    if ([@"LOCALPROXY" isEqualToString:self.proxyMode]) {
+        NSLog(@"CDVWKWebViewEngine: trying to inject XHR proxy polyfill");
+        WKUserScript *wkScript = [self wkXHRProxyScript];
+        if (wkScript) {
+            [userContentController addUserScript:wkScript];
+        }
+    } else {
+        NSLog(@"CDVWKWebViewEngine: skipped XHR proxy polyfill");
+    }
+    
     WKWebViewConfiguration* configuration = [self createConfigurationFromSettings:settings];
     configuration.userContentController = userContentController;
-
+    
     // re-create WKWebView, since we need to update configuration
+    self.proxyMode = [settings cordovaSettingForKey:@"ProxyMode"];
+    if (self.proxyMode == nil) {
+        self.proxyMode = @"LOCALWEB";
+    }
+    
     WKWebView* wkWebView = [[WKWebView alloc] initWithFrame:self.engineWebView.frame configuration:configuration];
     wkWebView.UIDelegate = self.uiDelegate;
     self.engineWebView = wkWebView;
-
+    
     if (IsAtLeastiOSVersion(@"9.0") && [self.viewController isKindOfClass:[CDVViewController class]]) {
         wkWebView.customUserAgent = ((CDVViewController*) self.viewController).userAgent;
     }
-
+    
     if ([self.viewController conformsToProtocol:@protocol(WKUIDelegate)]) {
         wkWebView.UIDelegate = (id <WKUIDelegate>)self.viewController;
     }
-
+    
     if ([self.viewController conformsToProtocol:@protocol(WKNavigationDelegate)]) {
         wkWebView.navigationDelegate = (id <WKNavigationDelegate>)self.viewController;
     } else {
         wkWebView.navigationDelegate = (id <WKNavigationDelegate>)self;
     }
-
+    
     if ([self.viewController conformsToProtocol:@protocol(WKScriptMessageHandler)]) {
         [wkWebView.configuration.userContentController addScriptMessageHandler:(id < WKScriptMessageHandler >)self.viewController name:CDV_BRIDGE_NAME];
     }
-
+    
     [self updateSettings:settings];
-
+    
     // check if content thread has died on resume
     NSLog(@"%@", @"CDVWKWebViewEngine will reload WKWebView if required on resume");
     [[NSNotificationCenter defaultCenter]
      addObserver:self
      selector:@selector(onAppWillEnterForeground:)
      name:UIApplicationWillEnterForegroundNotification object:nil];
-
+    
     NSLog(@"Using Ionic WKWebView");
-
+    
     [self addURLObserver];
 }
 
@@ -195,16 +341,16 @@ static void * KVOContext = &KVOContext;
 {
     BOOL title_is_nil = (title == nil);
     BOOL location_is_blank = [[location absoluteString] isEqualToString:@"about:blank"];
-
+    
     BOOL reload = (title_is_nil || location_is_blank);
-
+    
 #ifdef DEBUG
     NSLog(@"%@", @"CDVWKWebViewEngine shouldReloadWebView::");
     NSLog(@"CDVWKWebViewEngine shouldReloadWebView title: %@", title);
     NSLog(@"CDVWKWebViewEngine shouldReloadWebView location: %@", [location absoluteString]);
     NSLog(@"CDVWKWebViewEngine shouldReloadWebView reload: %u", reload);
 #endif
-
+    
     return reload;
 }
 
@@ -212,9 +358,8 @@ static void * KVOContext = &KVOContext;
 - (id)loadRequest:(NSURLRequest*)request
 {
     if ([self canLoadRequest:request]) { // can load, differentiate between file urls and other schemes
-        if (request.URL.fileURL) {
-
-            NSURL *url = [[NSURL URLWithString:@"http://localhost:8080"] URLByAppendingPathComponent:request.URL.path];
+        if (request.URL.fileURL && [@"LOCALWEB" isEqualToString:self.proxyMode]) {
+            NSURL *url = [[NSURL URLWithString:self.proxyUrl] URLByAppendingPathComponent:request.URL.path];
             NSURLRequest *request2 = [NSURLRequest requestWithURL:url];
             return [(WKWebView*)_engineWebView loadRequest:request2];
         } else {
@@ -250,7 +395,7 @@ static void * KVOContext = &KVOContext;
 {
     // See: https://issues.apache.org/jira/browse/CB-9636
     SEL wk_sel = NSSelectorFromString(CDV_WKWEBVIEW_FILE_URL_LOAD_SELECTOR);
-
+    
     // if it's a file URL, check whether WKWebView has the selector (which is in iOS 9 and up only)
     if (request.URL.fileURL) {
         return [_engineWebView respondsToSelector:wk_sel];
@@ -262,17 +407,17 @@ static void * KVOContext = &KVOContext;
 - (void)updateSettings:(NSDictionary*)settings
 {
     WKWebView* wkWebView = (WKWebView*)_engineWebView;
-
+    
     wkWebView.configuration.preferences.minimumFontSize = [settings cordovaFloatSettingForKey:@"MinimumFontSize" defaultValue:0.0];
-
+    
     /*
      wkWebView.configuration.preferences.javaScriptEnabled = [settings cordovaBoolSettingForKey:@"JavaScriptEnabled" default:YES];
      wkWebView.configuration.preferences.javaScriptCanOpenWindowsAutomatically = [settings cordovaBoolSettingForKey:@"JavaScriptCanOpenWindowsAutomatically" default:NO];
      */
-
+    
     // By default, DisallowOverscroll is false (thus bounce is allowed)
     BOOL bounceAllowed = !([settings cordovaBoolSettingForKey:@"DisallowOverscroll" defaultValue:NO]);
-
+    
     // prevent webView from bouncing
     if (!bounceAllowed) {
         if ([wkWebView respondsToSelector:@selector(scrollView)]) {
@@ -285,15 +430,15 @@ static void * KVOContext = &KVOContext;
             }
         }
     }
-
+    
     wkWebView.scrollView.scrollEnabled = [settings cordovaFloatSettingForKey:@"ScrollEnabled" defaultValue:YES];
-
+    
     NSString* decelerationSetting = [settings cordovaSettingForKey:@"WKWebViewDecelerationSpeed"];
     if (!decelerationSetting) {
         // Fallback to the UIWebView-named preference
         decelerationSetting = [settings cordovaSettingForKey:@"UIWebViewDecelerationSpeed"];
     }
-
+    
     if (![@"fast" isEqualToString:decelerationSetting]) {
         [wkWebView.scrollView setDecelerationRate:UIScrollViewDecelerationRateNormal];
     } else {
@@ -307,12 +452,12 @@ static void * KVOContext = &KVOContext;
     NSDictionary* settings = [info objectForKey:kCDVWebViewEngineWebViewPreferences];
     id navigationDelegate = [info objectForKey:kCDVWebViewEngineWKNavigationDelegate];
     id uiDelegate = [info objectForKey:kCDVWebViewEngineWKUIDelegate];
-
+    
     WKWebView* wkWebView = (WKWebView*)_engineWebView;
-
+    
     if (scriptMessageHandlers && [scriptMessageHandlers isKindOfClass:[NSDictionary class]]) {
         NSArray* allKeys = [scriptMessageHandlers allKeys];
-
+        
         for (NSString* key in allKeys) {
             id object = [scriptMessageHandlers objectForKey:key];
             if ([object conformsToProtocol:@protocol(WKScriptMessageHandler)]) {
@@ -320,15 +465,15 @@ static void * KVOContext = &KVOContext;
             }
         }
     }
-
+    
     if (navigationDelegate && [navigationDelegate conformsToProtocol:@protocol(WKNavigationDelegate)]) {
         wkWebView.navigationDelegate = navigationDelegate;
     }
-
+    
     if (uiDelegate && [uiDelegate conformsToProtocol:@protocol(WKUIDelegate)]) {
         wkWebView.UIDelegate = uiDelegate;
     }
-
+    
     if (settings && [settings isKindOfClass:[NSDictionary class]]) {
         [self updateSettings:settings];
     }
@@ -366,6 +511,30 @@ static void * KVOContext = &KVOContext;
                                forMainFrameOnly:YES];
 }
 
+- (WKUserScript*)wkXHRProxyScript
+{
+    NSString *scriptFile = [[NSBundle mainBundle] pathForResource:@"www/wk-xhr" ofType:@"js"];
+    if (scriptFile == nil) {
+        NSLog(@"CDVWKWebViewEngine: WK xhr was not found");
+        return nil;
+    }
+    NSError *error = nil;
+    NSString *source = [NSString stringWithContentsOfFile:scriptFile encoding:NSUTF8StringEncoding error:&error];
+    if (source == nil || error != nil) {
+        NSLog(@"CDVWKWebViewEngine: WK plugin can not be loaded: %@", error);
+        return nil;
+    }
+    self.secret = [[NSUUID UUID] UUIDString];
+
+    source = [source stringByReplacingOccurrencesOfString:@"${proxyurl}"
+                                               withString:self.proxyUrl];
+    source = [source stringByReplacingOccurrencesOfString:@"${secret}"
+                                               withString:self.secret];
+    return [[WKUserScript alloc] initWithSource:source
+                                  injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                               forMainFrameOnly:YES];
+}
+
 #pragma mark WKScriptMessageHandler implementation
 
 - (void)userContentController:(WKUserContentController*)userContentController didReceiveScriptMessage:(WKScriptMessage*)message
@@ -380,11 +549,11 @@ static void * KVOContext = &KVOContext;
 - (void)handleCordovaMessage:(WKScriptMessage*)message
 {
     CDVViewController* vc = (CDVViewController*)self.viewController;
-
+    
     NSArray* jsonEntry = message.body; // NSString:callbackId, NSString:service, NSString:action, NSArray:args
     CDVInvokedUrlCommand* command = [CDVInvokedUrlCommand commandFromJson:jsonEntry];
     CDV_EXEC_LOG(@"Exec(%@): Calling %@.%@", command.callbackId, command.className, command.methodName);
-
+    
     if (![vc.commandQueue execute:command]) {
 #ifdef DEBUG
         NSError* error = nil;
@@ -392,16 +561,16 @@ static void * KVOContext = &KVOContext;
         NSData* jsonData = [NSJSONSerialization dataWithJSONObject:jsonEntry
                                                            options:0
                                                              error:&error];
-
+        
         if (error == nil) {
             commandJson = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
         }
-
+        
         static NSUInteger maxLogLength = 1024;
         NSString* commandString = ([commandJson length] > maxLogLength) ?
         [NSString stringWithFormat : @"%@[...]", [commandJson substringToIndex:maxLogLength]] :
         commandJson;
-
+        
         NSLog(@"FAILED pluginJSON = %@", commandString);
 #endif
     }
@@ -419,13 +588,13 @@ static void * KVOContext = &KVOContext;
 {
     if([node isKindOfClass: [UIScrollView class]]) {
         UIScrollView *nodeAsScroll = (UIScrollView *)node;
-
+        
         if([nodeAsScroll isScrollEnabled] && ![nodeAsScroll isHidden]) {
             [nodeAsScroll setScrollEnabled: NO];
             [nodeAsScroll setScrollEnabled: YES];
         }
     }
-
+    
     // iterate tree recursivelly
     for (UIView *child in [node subviews]) {
         [self recursiveStopScroll:child];
@@ -444,7 +613,7 @@ static void * KVOContext = &KVOContext;
 {
     CDVViewController* vc = (CDVViewController*)self.viewController;
     [CDVUserAgentUtil releaseLock:vc.userAgentLockToken];
-
+    
     [[NSNotificationCenter defaultCenter] postNotification:[NSNotification notificationWithName:CDVPageDidLoadNotification object:webView]];
 }
 
@@ -452,10 +621,10 @@ static void * KVOContext = &KVOContext;
 {
     CDVViewController* vc = (CDVViewController*)self.viewController;
     [CDVUserAgentUtil releaseLock:vc.userAgentLockToken];
-
+    
     NSString* message = [NSString stringWithFormat:@"Failed to load webpage with error: %@", [error localizedDescription]];
     NSLog(@"%@", message);
-
+    
     NSURL* errorUrl = vc.errorURL;
     if (errorUrl) {
         errorUrl = [NSURL URLWithString:[NSString stringWithFormat:@"?error=%@", [message stringByAddingPercentEscapesUsingEncoding:NSUTF8StringEncoding]] relativeToURL:errorUrl];
@@ -475,7 +644,7 @@ static void * KVOContext = &KVOContext;
     if ([url isFileURL]) {
         return YES;
     }
-
+    
     return NO;
 }
 
@@ -484,13 +653,13 @@ static void * KVOContext = &KVOContext;
 {
     NSURL* url = [navigationAction.request URL];
     CDVViewController* vc = (CDVViewController*)self.viewController;
-
+    
     /*
      * Give plugins the chance to handle the url
      */
     BOOL anyPluginsResponded = NO;
     BOOL shouldAllowRequest = NO;
-
+    
     for (NSString* pluginName in vc.pluginObjects) {
         CDVPlugin* plugin = [vc.pluginObjects objectForKey:pluginName];
         SEL selector = NSSelectorFromString(@"shouldOverrideLoadWithRequest:navigationType:");
@@ -502,7 +671,7 @@ static void * KVOContext = &KVOContext;
             }
         }
     }
-
+    
     if (!anyPluginsResponded) {
         /*
          * Handle all other types of urls (tel:, sms:), and requests to load a url in the main webview.
@@ -512,8 +681,8 @@ static void * KVOContext = &KVOContext;
             [[NSNotificationCenter defaultCenter] postNotification:[NSNotification notificationWithName:CDVPluginHandleOpenURLNotification object:url]];
         }
     }
-
-
+    
+    
     if (shouldAllowRequest) {
         NSString *scheme = url.scheme;
         if ([scheme isEqualToString:@"tel"] || [scheme isEqualToString:@"mailto"]) {
