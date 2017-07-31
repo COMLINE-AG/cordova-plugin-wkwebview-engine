@@ -15,7 +15,7 @@
                 // redirected in proxy server later
                 this['__wkwebview_symbol__url'] = url;
                 // set the url to proxy server
-                args[1] = '${proxyurl}/api';
+                args[1] = '${proxyurl}/service';
             }
             return OriginalXMLHttpRequestPrototypeOpen.apply(this, arguments);
         }

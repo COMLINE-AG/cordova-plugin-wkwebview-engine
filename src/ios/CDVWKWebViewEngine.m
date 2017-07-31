@@ -90,7 +90,7 @@
     } else if ([@"LOCALPROXY" isEqualToString:self.proxyMode]) {
         self.webServer = [[GCDWebServer alloc] init];
         [self.webServer addHandlerForMethod:@"POST"
-                                  pathRegex:@"/api/*"
+                                  pathRegex:@"/service/*"
                                requestClass:[GCDWebServerDataRequest class]
                           asyncProcessBlock:^(GCDWebServerDataRequest *request, GCDWebServerCompletionBlock completionBlock) {
                               CDVWKWebViewEngine *strongSelf = weakSelf;
